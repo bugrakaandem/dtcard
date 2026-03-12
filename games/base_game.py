@@ -1,6 +1,4 @@
 from abc import ABC, abstractmethod
-import numpy as np
-
 
 class BaseCardGame(ABC):
     def __init__(self, num_players=4, deck_size=52):
@@ -26,7 +24,6 @@ class BaseCardGame(ABC):
     def get_observation(self, player_index):
         pass
 
-    @abstractmethod
     def card_id_to_string(self, card_id):
         if card_id is None: return "None"
         if card_id >= 52:

@@ -10,21 +10,17 @@ project_root = os.path.dirname(os.path.dirname(current_dir))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from thesis_framework.games.hearts import HeartsGame
-from thesis_framework.games.whist import WhistGame
-from thesis_framework.games.spades import SpadesGame
+from games.hearts import HeartsGame
+from games.whist import WhistGame
+from games.spades import SpadesGame
 
-from thesis_framework.agents.random_agent import RandomAgent
-from thesis_framework.agents.rule_based_agent import RuleBasedAgent
-from thesis_framework.agents.whist_rule_based_agent import WhistRuleBasedAgent
-from thesis_framework.agents.spades_rule_based_agent import SpadesRuleBasedAgent
+from agents.random_agent import RandomAgent
+from agents.rule_based_agent import RuleBasedAgent
+from agents.whist_rule_based_agent import WhistRuleBasedAgent
+from agents.spades_rule_based_agent import SpadesRuleBasedAgent
 
 
 def _legal_mask_from_moves(legal_moves, act_dim: int = 52) -> np.ndarray:
-    """
-    legal_moves: list[int] or list[Card-like] (with .id)
-    Returns: (act_dim,) uint8 mask
-    """
     mask = np.zeros((act_dim,), dtype=np.uint8)
     for m in legal_moves:
         mid = int(m) if isinstance(m, (int, np.integer)) else int(getattr(m, "id", m))
@@ -34,35 +30,27 @@ def _legal_mask_from_moves(legal_moves, act_dim: int = 52) -> np.ndarray:
 
 
 def create_dataset(
-    num_games: int = 1000,
-    output_path: str = "data/hearts_random_1k.pkl",
-    agent_type: str = "random",
-    game_name: str = "hearts",
-    store_legal_masks: bool = True,
+        num_games: int = 1000,
+        output_path: str = "data/hearts_random_1k.pkl",
+        agent_type: str = "random",
+        game_name: str = "hearts",
+        store_legal_masks: bool = True,
+        dt_model=None,
+        dqn_model=None,
+        device: str = "cpu",
+        target_return: float = 1.0,
+        context_len: int = 13,
+        dt_temperature: float = 0.5
 ):
-    """
-    Offline dataset generator (Player0 trajectories only).
-
-    Reward Alignment (CRITICAL):
-    - Player0 ödülü gecikmeli gelebilir (trick sonunda vb.).
-    - rewards[0] != 0 olduğunda, Player0'ın SON aksiyonunun reward placeholder'ına back-fill yapıyoruz.
-
-    store_legal_masks:
-    - Player0'ın her aksiyon anındaki legal move set'ini (52-dim) maske olarak kaydeder.
-      Bu maske, Table IV ablation (train-time action masking) için gereklidir.
-    """
-
     print(f"Generating {num_games} games for {game_name.upper()} using {agent_type.upper()} agents...")
-    print("Applying 'Delayed Reward Alignment' fix...")
 
     all_obs = []
     all_actions = []
     all_rewards = []
     all_done_idxs = []
-    all_legal_masks = []  # aligns with Player0 steps
+    all_legal_masks = []
     total_wins = 0
 
-    # Game select
     if game_name == "hearts":
         game = HeartsGame()
     elif game_name == "whist":
@@ -78,6 +66,7 @@ def create_dataset(
     for _ in pbar:
         obs = game.reset()
 
+        p0_is_dt = False
         if agent_type == "random":
             agents = [RandomAgent(i) for i in range(4)]
         elif agent_type == "rule_based":
@@ -88,12 +77,65 @@ def create_dataset(
             else:
                 agents = [RuleBasedAgent(i) for i in range(4)]
         elif agent_type == "mixed":
-            if game_name == "whist":
-                agents = [WhistRuleBasedAgent(0), RandomAgent(1), WhistRuleBasedAgent(2), RandomAgent(3)]
-            elif game_name == "spades":
-                agents = [SpadesRuleBasedAgent(0), RandomAgent(1), SpadesRuleBasedAgent(2), RandomAgent(3)]
+            if np.random.rand() < 0.8:
+                if game_name == "whist":
+                    agents = [WhistRuleBasedAgent(i) for i in range(4)]
+                elif game_name == "spades":
+                    agents = [SpadesRuleBasedAgent(i) for i in range(4)]
+                else:
+                    agents = [RuleBasedAgent(i) for i in range(4)]
             else:
-                agents = [RuleBasedAgent(0), RandomAgent(1), RuleBasedAgent(2), RandomAgent(3)]
+                agents = [RandomAgent(i) for i in range(4)]
+        elif agent_type == "dt_mixed":
+            if dt_model is None:
+                raise ValueError("dt_model must be provided for dt_mixed")
+
+            from train_pipeline import DecisionTransformerAgent
+            dt_agent = DecisionTransformerAgent(dt_model, context_len, device, target_return)
+
+            rule_agents = [WhistRuleBasedAgent(i) if game_name == "whist" else SpadesRuleBasedAgent(
+                i) if game_name == "spades" else RuleBasedAgent(i) for i in range(4)]
+            rand_agents = [RandomAgent(i) for i in range(4)]
+            agents = [None] * 4
+
+            rand_val = np.random.rand()
+            if rand_val < 0.4:
+                agents[0] = dt_agent
+                p0_is_dt = True
+            elif rand_val < 0.8:
+                agents[0] = rule_agents[0]
+            else:
+                agents[0] = rand_agents[0]
+
+            for i in range(1, 4):
+                agents[i] = rule_agents[i] if np.random.rand() < 0.7 else rand_agents[i]
+        elif agent_type == "dqn":
+            if dqn_model is None:
+                raise ValueError("dqn_model must be provided for dqn")
+            from agents.dqn_agent import DQNAgentWrapper
+            agents = [DQNAgentWrapper(i, dqn_model, device) for i in range(4)]
+
+        elif agent_type == "dqn_mixed":
+            if dqn_model is None:
+                raise ValueError("dqn_model must be provided for dqn_mixed")
+            from agents.dqn_agent import DQNAgentWrapper
+            dqn_agent = DQNAgentWrapper(0, dqn_model, device)
+
+            rule_agents = [WhistRuleBasedAgent(i) if game_name == "whist" else SpadesRuleBasedAgent(
+                i) if game_name == "spades" else RuleBasedAgent(i) for i in range(4)]
+            rand_agents = [RandomAgent(i) for i in range(4)]
+            agents = [None] * 4
+
+            rand_val = np.random.rand()
+            if rand_val < 0.4:
+                agents[0] = dqn_agent
+            elif rand_val < 0.8:
+                agents[0] = rule_agents[0]
+            else:
+                agents[0] = rand_agents[0]
+
+            for i in range(1, 4):
+                agents[i] = rule_agents[i] if np.random.rand() < 0.7 else rand_agents[i]
         else:
             raise ValueError(f"Unknown agent_type: {agent_type}")
 
@@ -110,25 +152,28 @@ def create_dataset(
             agent = agents[current_player]
             legal_moves = game.get_legal_moves(current_player)
 
-            action = agent.select_action(obs, legal_moves)
+            if current_player == 0 and p0_is_dt:
+                action = agent.select_action(obs, legal_moves, temperature=dt_temperature)
+            else:
+                action = agent.select_action(obs, legal_moves)
+
             next_obs, rewards, done, info = game.step(action)
 
-            # --- Reward alignment to Player0's last recorded action ---
             if current_player == 0:
                 traj_obs.append(obs)
-                traj_actions.append(int(action) if isinstance(action, (int, np.integer)) else int(getattr(action, "id", action)))
-                traj_rewards.append(0.0)  # placeholder
+                traj_actions.append(
+                    int(action) if isinstance(action, (int, np.integer)) else int(getattr(action, "id", action)))
+                traj_rewards.append(0.0)
                 if store_legal_masks:
                     traj_legals.append(_legal_mask_from_moves(legal_moves))
-            # If Player0 gets a reward/penalty (even if it's not his turn), back-fill to last action
             if rewards is not None and len(rewards) > 0 and float(rewards[0]) != 0.0:
                 if len(traj_rewards) > 0:
                     traj_rewards[-1] += float(rewards[0])
-            # ---------------------------------------------------------
+                if p0_is_dt:
+                    agents[0].update_rtg(float(rewards[0]))
 
             obs = next_obs
 
-        # finalize episode
         current_len = len(traj_actions)
         all_obs.extend(traj_obs)
         all_actions.extend(traj_actions)
@@ -143,7 +188,6 @@ def create_dataset(
         if hasattr(game, "tricks_won") and isinstance(game.tricks_won, (list, tuple)) and len(game.tricks_won) == 4:
             win = (game.tricks_won[0] == max(game.tricks_won))
         elif hasattr(game, "total_scores") and game.total_scores:
-            # Hearts-like: lower is better (penalty)
             win = (game.total_scores[0] == min(game.total_scores))
         elif isinstance(info, dict) and "winner" in info:
             win = (int(info["winner"]) == 0)
@@ -200,17 +244,16 @@ def create_dataset(
         pickle.dump(dataset, f)
 
     print(f"\nDataset saved to {output_path}")
-    print(f"Total Transitions (Player0): {len(dataset['actions'])}")
-    print(f"Est. Win Rate (Player 0, best-effort): {total_wins / max(1, num_games):.4f}")
 
 
 def _parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--game", type=str, default="hearts", choices=["hearts", "whist", "spades"])
     parser.add_argument("--num_games", type=int, default=1000)
-    parser.add_argument("--agent", type=str, default="random", choices=["random", "rule_based", "mixed"])
+    parser.add_argument("--agent", type=str, default="random", choices=["random", "rule_based", "mixed", "dt_mixed"])
     parser.add_argument("--out", type=str, default=None)
-    parser.add_argument("--no_legal_masks", action="store_true", help="Do NOT store Player0 legal masks in the dataset.")
+    parser.add_argument("--no_legal_masks", action="store_true",
+                        help="Do NOT store Player0 legal masks in the dataset.")
     return parser.parse_args()
 
 
